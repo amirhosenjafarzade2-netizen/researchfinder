@@ -51,7 +51,7 @@ class Paper:
     doi: str = ""
     country: str = ""
     institution: str = ""
-    field: str = ""
+    subject_field: str = ""
     source: str = ""
     oa_urls: list = field(default_factory=list)   # ordered candidate PDF URLs, tried in sequence
     landing_url: str = ""
@@ -190,7 +190,7 @@ def search_openalex(keyword, year_from, year_to, country, institution, field_nam
                 doi=(w.get("doi") or "").replace("https://doi.org/", ""),
                 country=country,
                 institution=institution,
-                field=field_name,
+                subject_field=field_name,
                 source="OpenAlex",
                 landing_url=w.get("id", ""),
                 is_oa=bool(oa.get("is_oa")),
@@ -717,8 +717,8 @@ def run_full_search(keyword_str, year_from, year_to, country, institution, field
     deduped = dedup_papers(all_papers)
     if field_name:
         for p in deduped:
-            if not p.field:
-                p.field = field_name
+            if not p.subject_field:
+                p.subject_field = field_name
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         deduped = list(ex.map(enrich_with_unpaywall, deduped))
