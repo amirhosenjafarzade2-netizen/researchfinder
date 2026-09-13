@@ -144,12 +144,14 @@ def search_openalex(keyword, year_from, year_to, country, institution, field_nam
     papers = []
     try:
         filters = [f"from_publication_date:{year_from}-01-01",
-                   f"to_publication_date:{year_to}-12-31",
-                   "has_fulltext:true"]
+                   f"to_publication_date:{year_to}-12-31"]
         if country:
             filters.append(f"institutions.country_code:{country}")
+        # Real OpenAlex `type` vocabulary (Crossref-based): article, dissertation,
+        # proceedings-article, report, book, etc. "journal-article" and "paratext"
+        # are not valid values here and were silently producing zero matches.
         type_map = {"thesis": "dissertation", "research": "article",
-                    "conference": "paratext|preprint", "report": "report"}
+                    "conference": "proceedings-article", "report": "report"}
         if doc_type != "all" and doc_type in type_map:
             filters.append(f"type:{type_map[doc_type]}")
         params = {
@@ -160,7 +162,10 @@ def search_openalex(keyword, year_from, year_to, country, institution, field_nam
         }
         r = requests.get("https://api.openalex.org/works", params=params,
                           headers=HEADERS, timeout=DEFAULT_TIMEOUT)
-        r.raise_for_status()
+        if r.status_code != 200:
+            st.session_state.setdefault("errors", []).append(
+                f"OpenAlex: HTTP {r.status_code} — {r.text[:200]}")
+            return papers
         for w in r.json().get("results", []):
             title = w.get("title") or ""
             if institution:
@@ -259,12 +264,17 @@ def search_crossref(keyword, year_from, year_to, limit, doc_type="all"):
 
 
 def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"):
-    """CORE's repository network is especially strong for theses."""
+    """CORE's v3 API requires a (free) API key for essentially all requests now —
+    without one, every call returns 401 and CORE silently contributes zero results."""
     papers = []
+    if not api_key:
+        st.session_state.setdefault("errors", []).append(
+            "CORE: no API key provided — CORE's v3 API requires a free key for search "
+            "(https://core.ac.uk/services/api), so this source returned nothing.")
+        return papers
     try:
         headers = dict(HEADERS)
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers["Authorization"] = f"Bearer {api_key}"
         q = f'{keyword} AND yearPublished>={year_from} AND yearPublished<={year_to}'
         type_map = {"thesis": "thesis", "research": "research", "conference": "conference proceedings"}
         if doc_type != "all" and doc_type in type_map:
@@ -273,8 +283,13 @@ def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"
         r = requests.get("https://api.core.ac.uk/v3/search/works", params=params,
                           headers=headers, timeout=DEFAULT_TIMEOUT)
         if r.status_code == 401:
+            st.session_state.setdefault("errors", []).append(
+                "CORE: API key was rejected (401) — double-check the key is valid.")
             return papers
-        r.raise_for_status()
+        if r.status_code != 200:
+            st.session_state.setdefault("errors", []).append(
+                f"CORE: HTTP {r.status_code} — {r.text[:200]}")
+            return papers
         for w in r.json().get("results", []):
             raw_type = (w.get("documentType") or "").lower()
             if "thesis" in raw_type:
@@ -843,7 +858,10 @@ with st.form("search_form"):
             default=["OpenAlex", "Crossref", "DOAJ"],
             help="DOAJ indexes journals only and is skipped automatically outside 'Research papers'/'All'.",
         )
-        core_key = st.text_input("CORE API key (optional — improves CORE results, esp. for theses)", type="password")
+        core_key = st.text_input(
+            "CORE API key (required for CORE results — get a free one at core.ac.uk/services/api)",
+            type="password",
+        )
 
     submitted = st.form_submit_button("Search", type="primary", use_container_width=True)
 
@@ -929,9 +947,9 @@ if submitted:
         st.session_state["search_stage"] = "final"
         st.success(f"Found {len(candidates)} unique matches with a resolvable open-access candidate link.")
         if st.session_state.get("errors"):
-            with st.expander("⚠️ Some sources had issues"):
-                for e in st.session_state["errors"]:
-                    st.write("-", e)
+            st.warning("Some sources didn't return results:")
+            for e in st.session_state["errors"]:
+                st.write("-", e)
 
 # --------------------------------------------------------------------------
 # Query expansion step
