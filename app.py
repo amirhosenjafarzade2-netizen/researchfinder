@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
 from pypdf import PdfWriter, PdfReader
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
@@ -937,6 +939,430 @@ def build_csv(downloaded_papers):
     return "\n".join(lines).encode("utf-8")
 
 
+# ==========================================================================
+# PhD Position Finder module
+# --------------------------------------------------------------------------
+# Searches PhD-position listing sites for a keyword and reports, where the
+# site's listing/search page exposes it: title, institution/country, whether
+# the position is funded, and the research topic/description.
+#
+# IMPORTANT SCOPE NOTE:
+# - Sites below (findaphd.com, jobs.ac.uk, academicpositions.eu,
+#   universitypositions.eu, Euraxess, eurosciencejobs.com,
+#   nature.com/naturejobs, scholarshipdb.net) are scraped with
+#   requests + BeautifulSoup against their public search-results pages.
+#   These sites don't offer stable public JSON APIs, so this is a
+#   best-effort HTML scrape: if a site changes its page markup, its
+#   scraper here may need updated selectors — the "PhD finder debug" panel
+#   below shows the raw HTML fetched for each source so that's easy to spot.
+# - LinkedIn is intentionally NOT scraped: doing so would violate LinkedIn's
+#   Terms of Service and their automated-access protections. Likewise,
+#   "official university websites / professors' personal pages" have no
+#   consistent structure to scrape across thousands of institutions. For
+#   both, this module instead gives you ready-made manual search links.
+# ==========================================================================
+
+PHD_USER_AGENT = "PhDPositionFinder/1.0 (mailto:research-tool@example.com)"
+PHD_HEADERS = {"User-Agent": PHD_USER_AGENT}
+PHD_TIMEOUT = 20
+
+FUNDING_POSITIVE_WORDS = [
+    "fully funded", "fully-funded", "funded position", "funded phd",
+    "scholarship", "stipend", "studentship", "salary", "grant covers",
+    "tuition waiver", "fee waiver", "bursary",
+]
+FUNDING_NEGATIVE_WORDS = [
+    "self-funded", "self funded", "unfunded", "no funding",
+    "fees apply", "own funding",
+]
+
+
+@dataclass
+class PhDPosition:
+    title: str
+    institution: str = ""
+    country: str = ""
+    url: str = ""
+    funded: str = "Unknown"   # "Yes" | "No" | "Unknown"
+    topic: str = ""
+    source: str = ""
+
+    def key(self):
+        norm = unicodedata.normalize("NFKD", (self.title or "") + (self.url or "")).lower()
+        norm = re.sub(r"[^a-z0-9]+", "", norm)
+        return norm[:160]
+
+
+def _classify_funding(text):
+    t = (text or "").lower()
+    if any(w in t for w in FUNDING_NEGATIVE_WORDS):
+        return "No"
+    if any(w in t for w in FUNDING_POSITIVE_WORDS):
+        return "Yes"
+    return "Unknown"
+
+
+def _phd_debug_log(source, url, status, note=""):
+    st.session_state.setdefault("phd_debug", []).append({
+        "source": source, "url": url, "status": status, "note": note,
+    })
+
+
+def _phd_fetch(url, source, params=None):
+    """Shared fetch helper with consistent error handling + debug logging."""
+    try:
+        r = requests.get(url, headers=PHD_HEADERS, params=params, timeout=PHD_TIMEOUT)
+        _phd_debug_log(source, r.url, r.status_code, r.text[:1500])
+        if r.status_code != 200:
+            st.session_state.setdefault("phd_errors", []).append(
+                f"{source}: HTTP {r.status_code} for {r.url}")
+            return None
+        return r.text
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"{source}: {type(e).__name__}: {e}")
+        _phd_debug_log(source, url, "exception", str(e))
+        return None
+
+
+def search_findaphd(keyword, limit=30):
+    """findaphd.com — large PhD listing database, UK-heavy but global."""
+    positions = []
+    url = "https://www.findaphd.com/phds/"
+    html = _phd_fetch(url, "findaphd.com", params={"Keywords": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        # findaphd listing rows commonly use an <a> with a project/phds link
+        # wrapped in a result container; fall back to any anchor matching
+        # the /phds/project pattern if a dedicated container class isn't found.
+        anchors = soup.select('a[href*="/phds/project/"]')
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            if not href or href in seen_hrefs:
+                continue
+            title = a.get_text(strip=True)
+            if not title or len(title) < 5:
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://www.findaphd.com" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            institution = ""
+            inst_tag = container.select_one(".instTitle, .phd-result__inst, .instName")
+            if inst_tag:
+                institution = inst_tag.get_text(strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                institution=institution,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source="findaphd.com",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "findaphd.com: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"findaphd.com: parse error: {e}")
+    return positions
+
+
+def search_jobsacuk(keyword, limit=30):
+    """jobs.ac.uk — UK PhD/postdoc positions."""
+    positions = []
+    url = "https://www.jobs.ac.uk/search/"
+    html = _phd_fetch(url, "jobs.ac.uk", params={"keywords": keyword, "categories": "PhD"})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select('a[href*="/job/"]')
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 5:
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://www.jobs.ac.uk" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source="jobs.ac.uk",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "jobs.ac.uk: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"jobs.ac.uk: parse error: {e}")
+    return positions
+
+
+def search_academicpositions(keyword, limit=30, domain="academicpositions.eu"):
+    """academicpositions.eu / universitypositions.eu — academic posts across Europe."""
+    positions = []
+    url = f"https://{domain}/jobs"
+    html = _phd_fetch(url, domain, params={"query": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select('a[href*="/jobs/"]') or soup.select("a[href]")
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 8:
+                continue
+            if "/jobs/" not in href:
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else f"https://{domain}" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source=domain,
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                f"{domain}: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"{domain}: parse error: {e}")
+    return positions
+
+
+def search_euraxess(keyword, limit=30):
+    """Euraxess — EU research positions."""
+    positions = []
+    url = "https://euraxess.ec.europa.eu/jobs/search"
+    html = _phd_fetch(url, "Euraxess", params={"f%5B0%5D": "", "keywords": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select('a[href*="/jobs/"]')
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 8:
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://euraxess.ec.europa.eu" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source="Euraxess",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "Euraxess: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"Euraxess: parse error: {e}")
+    return positions
+
+
+def search_eurosciencejobs(keyword, limit=30):
+    """eurosciencejobs.com — international research/academic opportunities."""
+    positions = []
+    url = "https://www.eurosciencejobs.com/jobs.html"
+    html = _phd_fetch(url, "eurosciencejobs.com", params={"keywords": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select("a[href]")
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 8:
+                continue
+            if "job" not in href.lower():
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://www.eurosciencejobs.com" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source="eurosciencejobs.com",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "eurosciencejobs.com: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"eurosciencejobs.com: parse error: {e}")
+    return positions
+
+
+def search_naturejobs(keyword, limit=30):
+    """nature.com/naturejobs — international research/academic opportunities."""
+    positions = []
+    url = "https://www.nature.com/naturecareers/jobs"
+    html = _phd_fetch(url, "nature.com/naturejobs", params={"q": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select('a[href*="/naturecareers/"]')
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 8:
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://www.nature.com" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=_classify_funding(block_text),
+                topic=block_text[:220],
+                source="nature.com/naturejobs",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "nature.com/naturejobs: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"nature.com/naturejobs: parse error: {e}")
+    return positions
+
+
+def search_scholarshipdb(keyword, limit=30):
+    """scholarshipdb.net — funded positions in Europe. Since this source is
+    specifically for funded opportunities, results default to funded=Yes
+    unless the listing text explicitly says otherwise."""
+    positions = []
+    url = "https://scholarshipdb.net/Scholarships"
+    html = _phd_fetch(url, "scholarshipdb.net", params={"q": keyword})
+    if not html:
+        return positions
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select("a[href]")
+        seen_hrefs = set()
+        for a in anchors:
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            if not href or href in seen_hrefs or not title or len(title) < 8:
+                continue
+            if "scholarship" not in href.lower() and "phd" not in href.lower():
+                continue
+            seen_hrefs.add(href)
+            full_url = href if href.startswith("http") else "https://scholarshipdb.net" + href
+            container = a.find_parent(["div", "li", "article"]) or a
+            block_text = container.get_text(" ", strip=True)
+            funded = _classify_funding(block_text)
+            if funded == "Unknown":
+                funded = "Yes"  # this site is specifically a funded-scholarship directory
+            positions.append(PhDPosition(
+                title=title,
+                url=full_url,
+                funded=funded,
+                topic=block_text[:220],
+                source="scholarshipdb.net",
+            ))
+            if len(positions) >= limit:
+                break
+        if not positions:
+            st.session_state.setdefault("phd_errors", []).append(
+                "scholarshipdb.net: page fetched OK but no listing links matched — "
+                "site markup may have changed, check the debug panel.")
+    except Exception as e:
+        st.session_state.setdefault("phd_errors", []).append(f"scholarshipdb.net: parse error: {e}")
+    return positions
+
+
+PHD_SOURCE_FUNCS = {
+    "findaphd.com": lambda kw, limit: search_findaphd(kw, limit),
+    "jobs.ac.uk": lambda kw, limit: search_jobsacuk(kw, limit),
+    "academicpositions.eu": lambda kw, limit: search_academicpositions(kw, limit, "academicpositions.eu"),
+    "universitypositions.eu": lambda kw, limit: search_academicpositions(kw, limit, "universitypositions.eu"),
+    "Euraxess": lambda kw, limit: search_euraxess(kw, limit),
+    "eurosciencejobs.com": lambda kw, limit: search_eurosciencejobs(kw, limit),
+    "nature.com/naturejobs": lambda kw, limit: search_naturejobs(kw, limit),
+    "scholarshipdb.net": lambda kw, limit: search_scholarshipdb(kw, limit),
+}
+
+
+def dedup_phd_positions(positions):
+    seen = {}
+    for p in positions:
+        k = p.key()
+        if k not in seen:
+            seen[k] = p
+    return list(seen.values())
+
+
+def build_phd_manual_links(keyword):
+    """Channels that can't be safely/reliably automated: LinkedIn (ToS-protected
+    against scraping) and university/professor pages (no consistent structure).
+    Return ready-to-click search URLs instead."""
+    kw_q = quote_plus(keyword)
+    return [
+        {
+            "label": "LinkedIn — Jobs search",
+            "url": f"https://www.linkedin.com/jobs/search/?keywords={kw_q}%20PhD",
+            "note": "Not scraped (against LinkedIn's Terms of Service). "
+                    "Also a good place to follow target professors' posts/publications directly.",
+        },
+        {
+            "label": "Google — site-restricted university search",
+            "url": f"https://www.google.com/search?q={kw_q}+PhD+position+site%3Aac.uk+OR+site%3Aedu",
+            "note": "University portals and professors' personal pages vary too much to scrape "
+                    "reliably — worth checking target departments' pages directly and periodically.",
+        },
+    ]
+
+
+def build_phd_csv(positions):
+    lines = ["Title,Institution,Funded,Topic,Source,URL"]
+    for p in positions:
+        lines.append(
+            f'"{p.title}","{p.institution}",{p.funded},'
+            f'"{p.topic.replace(chr(34), chr(39))}",{p.source},{p.url}'
+        )
+    return "\n".join(lines).encode("utf-8")
+
+
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
@@ -1295,4 +1721,145 @@ st.caption(
     "skipped — old binary .doc/.ppt formats can't be reliably converted without external tools and are skipped. "
     "Each paper's candidate OA locations are tried in sequence with retries on transient errors before being "
     "marked as skipped. Paywalled papers without any OA copy are skipped, not bypassed."
+)
+
+# ==========================================================================
+# PhD Position Finder — UI
+# ==========================================================================
+
+st.divider()
+st.header("🎓 PhD Position Finder")
+st.caption(
+    "Searches PhD-position listing sites for your keyword and reports the institution, "
+    "whether the position looks funded, and the research topic where the listing exposes it. "
+    "LinkedIn and university/professor pages aren't automated (see note below) — you get "
+    "direct manual search links for those instead."
+)
+
+if "phd_stage" not in st.session_state:
+    st.session_state["phd_stage"] = "initial"
+
+with st.form("phd_search_form"):
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        phd_keyword = st.text_input(
+            "Keyword(s)", placeholder="e.g. machine learning, reservoir engineering, immunology",
+            key="phd_keyword_input",
+        )
+        phd_max_results = st.number_input(
+            "Max results per source", min_value=5, max_value=100, value=20, step=5,
+            key="phd_max_results_input",
+        )
+    with pcol2:
+        phd_sources = st.multiselect(
+            "Sites to search",
+            list(PHD_SOURCE_FUNCS.keys()),
+            default=list(PHD_SOURCE_FUNCS.keys()),
+            key="phd_sources_input",
+            help="Each of these is scraped from its public search page (no official API exists "
+                 "for any of them). If a source returns nothing, check the debug panel — its "
+                 "page markup may have changed since these scrapers were written.",
+        )
+        phd_show_debug = st.checkbox(
+            "Show debug info after searching (raw HTTP status/response per source)",
+            value=False, key="phd_show_debug_input",
+        )
+
+    phd_submitted = st.form_submit_button("Search PhD positions", type="primary", use_container_width=True)
+
+if phd_submitted:
+    if not phd_keyword.strip():
+        st.error("Please enter at least one keyword.")
+    else:
+        st.session_state["phd_errors"] = []
+        st.session_state["phd_debug"] = []
+        st.write("**Searching PhD-position sites:**")
+        phd_progress = st.progress(0.0, text="Starting search...")
+        total_sources = len(phd_sources) or 1
+        done = 0
+        all_positions = []
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures = {
+                ex.submit(PHD_SOURCE_FUNCS[src], phd_keyword.strip(), phd_max_results): src
+                for src in phd_sources
+            }
+            for fut in as_completed(futures):
+                src_name = futures[fut]
+                try:
+                    all_positions.extend(fut.result())
+                except Exception as e:
+                    st.session_state["phd_errors"].append(f"{src_name}: {e}")
+                done += 1
+                phd_progress.progress(done / total_sources, text=f"Searched {src_name}...")
+        phd_progress.progress(1.0, text="Search complete.")
+
+        deduped = dedup_phd_positions(all_positions)
+        st.session_state["phd_results"] = deduped
+        st.session_state["phd_manual_links"] = build_phd_manual_links(phd_keyword.strip())
+        st.session_state["phd_last_keyword"] = phd_keyword.strip()
+        st.session_state["phd_stage"] = "final"
+
+        st.success(f"Found {len(deduped)} listing(s) across {len(phd_sources)} source(s).")
+        if st.session_state.get("phd_errors"):
+            st.warning("Some sources had issues:")
+            for e in st.session_state["phd_errors"]:
+                st.write("-", e)
+        if phd_show_debug and st.session_state.get("phd_debug"):
+            with st.expander("🔍 PhD finder debug info (raw HTTP responses)"):
+                for item in st.session_state["phd_debug"]:
+                    st.json(item)
+
+if st.session_state.get("phd_stage") == "final" and st.session_state.get("phd_results") is not None:
+    phd_results = st.session_state["phd_results"]
+    st.subheader(f"Results for \"{st.session_state.get('phd_last_keyword','')}\" "
+                 f"({len(phd_results)} found)")
+
+    if phd_results:
+        phd_table_rows = [{
+            "Title": p.title,
+            "Institution": p.institution or "—",
+            "Funded": p.funded,
+            "Topic": p.topic or "—",
+            "Source": p.source,
+            "Link": p.url,
+        } for p in phd_results]
+
+        st.dataframe(
+            phd_table_rows,
+            column_config={
+                "Title": st.column_config.TextColumn("Title", width="medium"),
+                "Topic": st.column_config.TextColumn("Topic / description", width="large"),
+                "Link": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            height=min(60 + 35 * len(phd_results), 600),
+        )
+
+        st.download_button(
+            "📄 Download results (CSV)",
+            data=build_phd_csv(phd_results),
+            file_name=f"phd_positions_{st.session_state.get('phd_last_keyword','search').replace(' ', '_')[:30]}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No listings parsed from the scraped sources for this keyword — "
+                 "try a broader keyword, enable the debug panel above and re-search, "
+                 "or check the manual channels below.")
+
+    st.markdown("#### Channels to check manually")
+    st.caption(
+        "These aren't automated — LinkedIn actively blocks scraping and prohibits it in its "
+        "Terms of Service, and university/professor pages have no consistent structure to parse "
+        "across institutions. Direct search links are provided instead."
+    )
+    for link in st.session_state.get("phd_manual_links", []):
+        st.markdown(f"- **[{link['label']}]({link['url']})** — {link['note']}")
+
+st.caption(
+    "PhD Position Finder scrapes each site's public search-results page (no official public "
+    "API exists for these sources), so results depend on that page's current HTML structure. "
+    "\"Funded\" is inferred from keywords in the listing text (e.g. 'fully funded', 'stipend', "
+    "'self-funded') and may show 'Unknown' where the listing doesn't say either way — always "
+    "confirm funding status on the original listing before applying."
 )
