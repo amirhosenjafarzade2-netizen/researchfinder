@@ -2,3 +2,7 @@ streamlit
 requests
 pypdf
 reportlab
+beautifulsoup4
+python-docx
+python-pptx
+ebooklib
