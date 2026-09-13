@@ -263,22 +263,56 @@ def search_crossref(keyword, year_from, year_to, limit, doc_type="all"):
     return papers
 
 
+# --- CORE query-language helpers -------------------------------------------------
+#
+# CORE's search uses an Elasticsearch-style query string ("CORE API Query
+# Language"). Two things matter a lot for getting non-empty results:
+#
+#   1. Free-text / multi-word clauses that are OR'd together internally (an
+#      unquoted, un-field-scoped keyword phrase) MUST be wrapped in
+#      parentheses before being AND-ed with other clauses, or CORE's parser
+#      can mis-scope the AND and the query effectively over-constrains itself
+#      to zero hits. CORE's own docs example demonstrates this:
+#          q=(title:"machine learning" OR title:"artificial intelligence")
+#            AND yearPublished>="2015" AND yearPublished<="2024"
+#   2. `documentType` values must come from CORE's actual controlled
+#      vocabulary (e.g. 'research', 'thesis', 'conference proceedings',
+#      'report', ...) — arbitrary strings will just silently match nothing.
+#
+# Both are handled below.
+
+CORE_DOC_TYPE_MAP = {
+    "thesis": "thesis",
+    "research": "research",
+    "conference": "conference proceedings",
+    "report": "report",
+}
+
+
+def _build_core_query(keyword, year_from, year_to, doc_type="all"):
+    keyword = (keyword or "").strip()
+    clauses = []
+    if keyword:
+        # Group the free-text keyword so it doesn't get mis-scoped by the
+        # AND'd range/filter clauses that follow.
+        clauses.append(f"({keyword})")
+    clauses.append(f"yearPublished>={year_from}")
+    clauses.append(f"yearPublished<={year_to}")
+    if doc_type != "all" and doc_type in CORE_DOC_TYPE_MAP:
+        clauses.append(f'documentType:"{CORE_DOC_TYPE_MAP[doc_type]}"')
+    return " AND ".join(clauses)
+
+
 def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"):
-    """CORE's v3 API requires a (free) API key for essentially all requests now —
-    without one, every call returns 401 and CORE silently contributes zero results."""
+    """CORE's v3 API works without a key (100 tokens/day, no full text), but a
+    free API key raises the daily token allowance considerably and is required
+    to get full-text access. See https://core.ac.uk/services/api."""
     papers = []
-    if not api_key:
-        st.session_state.setdefault("errors", []).append(
-            "CORE: no API key provided — CORE's v3 API requires a free key for search "
-            "(https://core.ac.uk/services/api), so this source returned nothing.")
-        return papers
     try:
         headers = dict(HEADERS)
-        headers["Authorization"] = f"Bearer {api_key}"
-        q = f'{keyword} AND yearPublished>={year_from} AND yearPublished<={year_to}'
-        type_map = {"thesis": "thesis", "research": "research", "conference": "conference proceedings"}
-        if doc_type != "all" and doc_type in type_map:
-            q += f' AND documentType:"{type_map[doc_type]}"'
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        q = _build_core_query(keyword, year_from, year_to, doc_type)
         params = {"q": q, "limit": min(limit, 100)}
         r = requests.get("https://api.core.ac.uk/v3/search/works", params=params,
                           headers=headers, timeout=DEFAULT_TIMEOUT)
@@ -286,12 +320,27 @@ def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"
             st.session_state.setdefault("errors", []).append(
                 "CORE: API key was rejected (401) — double-check the key is valid.")
             return papers
+        if r.status_code == 429:
+            retry_after = r.headers.get("X-RateLimit-Retry-After", "unknown")
+            st.session_state.setdefault("errors", []).append(
+                f"CORE: rate-limited (429) — token allowance exhausted, retry after {retry_after}. "
+                "Unauthenticated/free-tier keys get a limited number of tokens per day; "
+                "see https://core.ac.uk/services/api for higher tiers.")
+            return papers
         if r.status_code != 200:
             st.session_state.setdefault("errors", []).append(
                 f"CORE: HTTP {r.status_code} — {r.text[:200]}")
             return papers
-        for w in r.json().get("results", []):
-            raw_type = (w.get("documentType") or "").lower()
+        results = r.json().get("results", [])
+        if not results:
+            st.session_state.setdefault("errors", []).append(
+                f"CORE: query returned 0 results for q={q!r} — try broadening the keyword "
+                "or document-type filter.")
+        for w in results:
+            raw_type = w.get("documentType") or w.get("document_type") or ""
+            if isinstance(raw_type, list):
+                raw_type = raw_type[0] if raw_type else ""
+            raw_type = (raw_type or "").lower()
             if "thesis" in raw_type:
                 ptype = "thesis"
             elif "conference" in raw_type:
@@ -300,19 +349,23 @@ def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"
                 ptype = "report"
             else:
                 ptype = "research"
+            source_urls = w.get("sourceFulltextUrls") or w.get("source_fulltext_urls") or []
+            download_url = w.get("downloadUrl") or w.get("download_url") or ""
+            authors = w.get("authors") or []
+            author_names = [a.get("name", "") if isinstance(a, dict) else str(a) for a in authors]
             p = Paper(
                 title=w.get("title", ""),
-                authors=[a.get("name", "") for a in (w.get("authors") or [])],
-                year=str(w.get("yearPublished") or ""),
+                authors=author_names,
+                year=str(w.get("yearPublished") or w.get("year_published") or ""),
                 venue=(w.get("publisher") or ""),
                 doi=w.get("doi", "") or "",
                 source="CORE",
-                landing_url=w.get("sourceFulltextUrls", [""])[0] if w.get("sourceFulltextUrls") else "",
+                landing_url=source_urls[0] if source_urls else "",
                 doc_type=ptype,
                 is_oa=True,
             )
-            p.add_candidate_url(w.get("downloadUrl", ""))
-            for alt in (w.get("sourceFulltextUrls") or []):
+            p.add_candidate_url(download_url)
+            for alt in source_urls:
                 p.add_candidate_url(alt)
             papers.append(p)
     except Exception as e:
@@ -435,13 +488,17 @@ def enrich_with_core_lookup(paper, api_key=None):
         headers = dict(HEADERS)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        q = f'doi:"{paper.doi}"' if paper.doi else paper.title
+        q = f'doi:"{paper.doi}"' if paper.doi else f"({paper.title})"
         r = requests.get("https://api.core.ac.uk/v3/search/works",
                           params={"q": q, "limit": 1}, headers=headers, timeout=DEFAULT_TIMEOUT)
         if r.status_code == 200:
             results = r.json().get("results", [])
             if results:
-                paper.add_candidate_url(results[0].get("downloadUrl", ""))
+                w = results[0]
+                download_url = w.get("downloadUrl") or w.get("download_url") or ""
+                paper.add_candidate_url(download_url)
+                for alt in (w.get("sourceFulltextUrls") or w.get("source_fulltext_urls") or []):
+                    paper.add_candidate_url(alt)
     except Exception:
         pass
     return paper
@@ -855,11 +912,13 @@ with st.form("search_form"):
         sources = st.multiselect(
             "Sources to search",
             ["OpenAlex", "Crossref", "CORE", "DOAJ", "OpenAIRE"],
-            default=["OpenAlex", "Crossref", "DOAJ"],
-            help="DOAJ indexes journals only and is skipped automatically outside 'Research papers'/'All'.",
+            default=["OpenAlex", "Crossref", "CORE", "DOAJ"],
+            help="DOAJ indexes journals only and is skipped automatically outside 'Research papers'/'All'. "
+                 "CORE works without a key but a free key (core.ac.uk/services/api) raises its daily "
+                 "rate limit a lot and is needed for full-text search.",
         )
         core_key = st.text_input(
-            "CORE API key (required for CORE results — get a free one at core.ac.uk/services/api)",
+            "CORE API key (optional — raises CORE's rate limit; get a free one at core.ac.uk/services/api)",
             type="password",
         )
 
