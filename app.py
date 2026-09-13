@@ -265,21 +265,26 @@ def search_crossref(keyword, year_from, year_to, limit, doc_type="all"):
 
 # --- CORE query-language helpers -------------------------------------------------
 #
-# CORE's search uses an Elasticsearch-style query string ("CORE API Query
-# Language"). Two things matter a lot for getting non-empty results:
+# FIX: The previous implementation crammed keyword + year-range + document-type
+# into a single Elasticsearch-style CORE query string
+# (e.g. "(enhanced oil recovery) AND yearPublished>=2015 AND yearPublished<=2026
+# AND documentType:\"research\""). CORE's query parser is finicky about how
+# free-text clauses combine with AND'd range/field filters, and this combined
+# form was silently producing zero hits even with a valid key.
 #
-#   1. Free-text / multi-word clauses that are OR'd together internally (an
-#      unquoted, un-field-scoped keyword phrase) MUST be wrapped in
-#      parentheses before being AND-ed with other clauses, or CORE's parser
-#      can mis-scope the AND and the query effectively over-constrains itself
-#      to zero hits. CORE's own docs example demonstrates this:
-#          q=(title:"machine learning" OR title:"artificial intelligence")
-#            AND yearPublished>="2015" AND yearPublished<="2024"
-#   2. `documentType` values must come from CORE's actual controlled
-#      vocabulary (e.g. 'research', 'thesis', 'conference proceedings',
-#      'report', ...) — arbitrary strings will just silently match nothing.
+# The fix below follows the simpler, more reliable approach: send CORE a plain
+# free-text query (no year/type filters baked into the query string at all),
+# then apply year and document-type filtering locally in Python on the
+# results that come back. This isolates whether a "no results" outcome is a
+# genuine lack of matches vs. a query-syntax problem, and a debug panel is
+# added below so HTTP status / raw response can be inspected directly.
 #
-# Both are handled below.
+# NOTE: unlike a stricter alternative that force-quotes every multi-word
+# keyword as an exact phrase, we keep multi-word keywords unquoted so CORE's
+# own relevance-ranked free-text search can match papers where the words
+# appear near each other but not as a rigid literal phrase. This avoids
+# swapping "zero results from bad query structure" for "zero results because
+# an exact-phrase match is too strict."
 
 CORE_DOC_TYPE_MAP = {
     "thesis": "thesis",
@@ -288,37 +293,69 @@ CORE_DOC_TYPE_MAP = {
     "report": "report",
 }
 
+# Characters that are meaningful in CORE's Elasticsearch-style query syntax
+# and need escaping when they appear inside plain user-typed keywords.
+_CORE_SPECIAL_CHARS_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/])')
 
-def _build_core_query(keyword, year_from, year_to, doc_type="all"):
+
+def _build_core_query(keyword):
+    """Build a conservative, free-text-only CORE query.
+
+    Year and document-type filtering are intentionally NOT included here —
+    they're applied locally after CORE returns results (see search_core).
+    """
     keyword = (keyword or "").strip()
-    clauses = []
-    if keyword:
-        # Group the free-text keyword so it doesn't get mis-scoped by the
-        # AND'd range/filter clauses that follow.
-        clauses.append(f"({keyword})")
-    clauses.append(f"yearPublished>={year_from}")
-    clauses.append(f"yearPublished<={year_to}")
-    if doc_type != "all" and doc_type in CORE_DOC_TYPE_MAP:
-        clauses.append(f'documentType:"{CORE_DOC_TYPE_MAP[doc_type]}"')
-    return " AND ".join(clauses)
+    if not keyword:
+        return "*"
+    # Escape CORE/Elasticsearch special characters so stray punctuation in a
+    # user's keyword doesn't break the query syntax.
+    escaped = _CORE_SPECIAL_CHARS_RE.sub(r"\\\1", keyword)
+    return escaped
 
 
 def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"):
     """CORE's v3 API works without a key (100 tokens/day, no full text), but a
     free API key raises the daily token allowance considerably and is required
-    to get full-text access. See https://core.ac.uk/services/api."""
+    to get full-text access. See https://core.ac.uk/services/api.
+
+    Filtering strategy: send a broad free-text query to CORE, then filter the
+    returned records locally by year and document type. This avoids relying
+    on CORE's AND-combination of free-text + range + field filters in a single
+    query string, which was the likely cause of spurious zero-result queries.
+    """
     papers = []
     try:
         headers = dict(HEADERS)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        q = _build_core_query(keyword, year_from, year_to, doc_type)
-        params = {"q": q, "limit": min(limit, 100)}
+
+        q = _build_core_query(keyword)
+        # Fetch generously above `limit` since local year/type filtering will
+        # discard some fraction of what CORE returns.
+        fetch_limit = min(max(limit * 2, limit, 1), 100)
+        params = {"q": q, "limit": fetch_limit}
+
         r = requests.get("https://api.core.ac.uk/v3/search/works", params=params,
                           headers=headers, timeout=DEFAULT_TIMEOUT)
+
+        # Keep a debug record regardless of outcome so the "CORE debug" panel
+        # in the UI can show exactly what happened on the most recent search.
+        debug_entry = {
+            "query": q,
+            "status": r.status_code,
+            "url": r.url,
+            "response_preview": r.text[:1000],
+        }
+        st.session_state.setdefault("core_debug", []).append(debug_entry)
+
         if r.status_code == 401:
             st.session_state.setdefault("errors", []).append(
-                "CORE: API key was rejected (401) — double-check the key is valid.")
+                "CORE: HTTP 401 — API key was rejected. Double-check the key is valid "
+                "and copied without extra spaces.")
+            return papers
+        if r.status_code == 403:
+            st.session_state.setdefault("errors", []).append(
+                "CORE: HTTP 403 — access denied for this key/account.")
             return papers
         if r.status_code == 429:
             retry_after = r.headers.get("X-RateLimit-Retry-After", "unknown")
@@ -331,17 +368,31 @@ def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"
             st.session_state.setdefault("errors", []).append(
                 f"CORE: HTTP {r.status_code} — {r.text[:200]}")
             return papers
+
         results = r.json().get("results", [])
         if not results:
             st.session_state.setdefault("errors", []).append(
-                f"CORE: query returned 0 results for q={q!r} — try broadening the keyword "
-                "or document-type filter.")
+                f"CORE: query {q!r} returned 0 results from CORE itself (not a local "
+                "filtering issue) — try a broader/shorter keyword.")
+            return papers
+
+        kept = 0
         for w in results:
+            # --- local year filtering -----------------------------------
+            year_raw = w.get("yearPublished") or w.get("year_published") or ""
+            try:
+                year_int = int(year_raw)
+            except (TypeError, ValueError):
+                year_int = None
+            if year_int is not None and (year_int < year_from or year_int > year_to):
+                continue
+
+            # --- local document-type filtering --------------------------
             raw_type = w.get("documentType") or w.get("document_type") or ""
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else ""
-            raw_type = (raw_type or "").lower()
-            if "thesis" in raw_type:
+            raw_type = str(raw_type).lower()
+            if "thesis" in raw_type or "dissertation" in raw_type:
                 ptype = "thesis"
             elif "conference" in raw_type:
                 ptype = "conference"
@@ -349,27 +400,44 @@ def search_core(keyword, year_from, year_to, limit, api_key=None, doc_type="all"
                 ptype = "report"
             else:
                 ptype = "research"
-            source_urls = w.get("sourceFulltextUrls") or w.get("source_fulltext_urls") or []
-            download_url = w.get("downloadUrl") or w.get("download_url") or ""
+            if doc_type != "all" and ptype != doc_type:
+                continue
+
             authors = w.get("authors") or []
             author_names = [a.get("name", "") if isinstance(a, dict) else str(a) for a in authors]
+
+            source_urls = w.get("sourceFulltextUrls") or w.get("source_fulltext_urls") or []
+            if isinstance(source_urls, str):
+                source_urls = [source_urls]
+            download_url = w.get("downloadUrl") or w.get("download_url") or ""
+
             p = Paper(
-                title=w.get("title", ""),
+                title=w.get("title", "") or "",
                 authors=author_names,
-                year=str(w.get("yearPublished") or w.get("year_published") or ""),
-                venue=(w.get("publisher") or ""),
+                year=str(year_raw),
+                venue=w.get("publisher", "") or "",
                 doi=w.get("doi", "") or "",
                 source="CORE",
-                landing_url=source_urls[0] if source_urls else "",
+                landing_url=source_urls[0] if source_urls else download_url,
                 doc_type=ptype,
                 is_oa=True,
             )
-            p.add_candidate_url(download_url)
+            if download_url:
+                p.add_candidate_url(download_url)
             for alt in source_urls:
                 p.add_candidate_url(alt)
             papers.append(p)
+            kept += 1
+            if kept >= limit:
+                break
+
+        if results and kept == 0:
+            st.session_state.setdefault("errors", []).append(
+                f"CORE: found {len(results)} raw result(s) for {q!r}, but all were filtered "
+                "out locally by year range / document type — try widening the year range "
+                "or setting Document type to 'All'.")
     except Exception as e:
-        st.session_state.setdefault("errors", []).append(f"CORE: {e}")
+        st.session_state.setdefault("errors", []).append(f"CORE: {type(e).__name__}: {e}")
     return papers
 
 
@@ -488,7 +556,7 @@ def enrich_with_core_lookup(paper, api_key=None):
         headers = dict(HEADERS)
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        q = f'doi:"{paper.doi}"' if paper.doi else f"({paper.title})"
+        q = f'doi:"{paper.doi}"' if paper.doi else _build_core_query(paper.title)
         r = requests.get("https://api.core.ac.uk/v3/search/works",
                           params={"q": q, "limit": 1}, headers=headers, timeout=DEFAULT_TIMEOUT)
         if r.status_code == 200:
@@ -921,6 +989,12 @@ with st.form("search_form"):
             "CORE API key (optional — raises CORE's rate limit; get a free one at core.ac.uk/services/api)",
             type="password",
         )
+        show_core_debug = st.checkbox(
+            "Show CORE debug info after searching (raw HTTP status/response)",
+            value=False,
+            help="Useful for diagnosing why CORE returns 0 results — shows the exact "
+                 "query sent and CORE's raw response.",
+        )
 
     submitted = st.form_submit_button("Search", type="primary", use_container_width=True)
 
@@ -934,10 +1008,23 @@ DOC_TYPE_VALUE = {
 
 
 def run_full_search(keyword_str, year_from, year_to, country, institution, field_name,
-                     max_results, doc_type, sources, core_key):
+                     max_results, doc_type, sources, core_key, progress=None):
     st.session_state["errors"] = []
+    st.session_state["core_debug"] = []
     per_source_limit = max(max_results * 4, 40)
     all_papers = []
+
+    # Fixed set of stages so the progress bar has a stable denominator:
+    # one step per source being queried, plus enrichment steps at the end.
+    total_steps = len(sources) + 2  # + unpaywall enrichment + core fallback enrichment
+    step = 0
+
+    def _tick(label):
+        nonlocal step
+        step += 1
+        if progress is not None:
+            progress.progress(min(step / total_steps, 1.0), text=label)
+
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {}
         if "OpenAlex" in sources:
@@ -951,10 +1038,12 @@ def run_full_search(keyword_str, year_from, year_to, country, institution, field
         if "OpenAIRE" in sources:
             futures[ex.submit(search_openaire, keyword_str, year_from, year_to, per_source_limit, doc_type)] = "OpenAIRE"
         for fut in as_completed(futures):
+            src_name = futures[fut]
             try:
                 all_papers.extend(fut.result())
             except Exception as e:
-                st.session_state["errors"].append(f"{futures[fut]}: {e}")
+                st.session_state["errors"].append(f"{src_name}: {e}")
+            _tick(f"Searched {src_name}...")
 
     if doc_type != "all":
         all_papers = [p for p in all_papers if (p.doc_type or "research") == doc_type]
@@ -967,8 +1056,11 @@ def run_full_search(keyword_str, year_from, year_to, country, institution, field
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         deduped = list(ex.map(enrich_with_unpaywall, deduped))
+    _tick("Cross-checking Unpaywall for extra OA links...")
+
     with ThreadPoolExecutor(max_workers=5) as ex:
         deduped = list(ex.map(lambda p: enrich_with_core_lookup(p, core_key or None), deduped))
+    _tick("Filling in remaining gaps via CORE...")
 
     return [p for p in deduped if p.oa_urls]
 
@@ -985,12 +1077,16 @@ if submitted:
         keyword=search_term, field_name=field_name, country=country, institution=institution,
         year_from=year_from, year_to=year_to, max_results=max_results, doc_type=doc_type,
         max_pdf_size_mb=max_pdf_size_mb, sources=sources, core_key=core_key,
+        show_core_debug=show_core_debug,
     )
 
     if use_query_expansion:
-        with st.spinner("Running an initial pass to learn common terminology..."):
-            first_pass = run_full_search(search_term, year_from, year_to, country, institution,
-                                          field_name, min(max_results, 15), doc_type, sources, core_key)
+        st.write("**Initial pass** — learning common terminology from early results:")
+        first_pass_progress = st.progress(0.0, text="Starting initial search...")
+        first_pass = run_full_search(search_term, year_from, year_to, country, institution,
+                                      field_name, min(max_results, 15), doc_type, sources, core_key,
+                                      progress=first_pass_progress)
+        first_pass_progress.progress(1.0, text="Initial pass complete.")
         terms = extract_keywords(first_pass)
         suggestions = suggest_expanded_queries(search_term, terms)
         st.session_state["expansion_first_pass"] = first_pass
@@ -998,9 +1094,12 @@ if submitted:
         st.session_state["search_stage"] = "suggested"
         st.session_state.pop("candidates", None)
     else:
-        with st.spinner("Querying scholarly databases..."):
-            candidates = run_full_search(search_term, year_from, year_to, country, institution,
-                                          field_name, max_results, doc_type, sources, core_key)
+        st.write("**Querying scholarly databases:**")
+        search_progress = st.progress(0.0, text="Starting search...")
+        candidates = run_full_search(search_term, year_from, year_to, country, institution,
+                                      field_name, max_results, doc_type, sources, core_key,
+                                      progress=search_progress)
+        search_progress.progress(1.0, text="Search complete.")
         st.session_state["candidates"] = candidates
         st.session_state["target_count"] = max_results
         st.session_state["search_stage"] = "final"
@@ -1009,6 +1108,10 @@ if submitted:
             st.warning("Some sources didn't return results:")
             for e in st.session_state["errors"]:
                 st.write("-", e)
+        if show_core_debug and st.session_state.get("core_debug"):
+            with st.expander("🔍 CORE debug info"):
+                for item in st.session_state["core_debug"]:
+                    st.json(item)
 
 # --------------------------------------------------------------------------
 # Query expansion step
@@ -1035,17 +1138,31 @@ if st.session_state.get("search_stage") == "suggested":
             st.error("Select at least one query to run.")
         else:
             all_candidates = []
-            with st.spinner(f"Searching {len(queries)} query variant(s)..."):
-                for q in queries:
-                    all_candidates.extend(run_full_search(
-                        q, fv["year_from"], fv["year_to"], fv["country"], fv["institution"],
-                        fv["field_name"], fv["max_results"], fv["doc_type"], fv["sources"], fv["core_key"]
-                    ))
+            st.write(f"**Searching {len(queries)} query variant(s):**")
+            overall_progress = st.progress(0.0, text="Starting expanded search...")
+            for qi, q in enumerate(queries):
+                sub_progress_placeholder = st.empty()
+                sub_progress = sub_progress_placeholder.progress(
+                    0.0, text=f"Query {qi + 1}/{len(queries)}: \"{q}\"..."
+                )
+                all_candidates.extend(run_full_search(
+                    q, fv["year_from"], fv["year_to"], fv["country"], fv["institution"],
+                    fv["field_name"], fv["max_results"], fv["doc_type"], fv["sources"], fv["core_key"],
+                    progress=sub_progress
+                ))
+                sub_progress_placeholder.empty()
+                overall_progress.progress((qi + 1) / len(queries),
+                                           text=f"Completed {qi + 1}/{len(queries)} quer(y/ies)...")
+            overall_progress.progress(1.0, text="Expanded search complete.")
             deduped = dedup_papers(all_candidates)
             st.session_state["candidates"] = deduped
             st.session_state["target_count"] = fv["max_results"]
             st.session_state["search_stage"] = "final"
             st.success(f"Found {len(deduped)} unique matches across {len(queries)} quer(y/ies).")
+            if fv.get("show_core_debug") and st.session_state.get("core_debug"):
+                with st.expander("🔍 CORE debug info"):
+                    for item in st.session_state["core_debug"]:
+                        st.json(item)
             st.rerun()
 
 # --------------------------------------------------------------------------
