@@ -23,6 +23,10 @@ from pypdf import PdfWriter, PdfReader
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_LEFT
+from xml.sax.saxutils import escape as _xml_escape
 
 # --------------------------------------------------------------------------
 # Config
@@ -448,6 +452,157 @@ def dedup_papers(papers):
 
 
 # --------------------------------------------------------------------------
+# Fallback document-to-PDF conversion
+#
+# When a candidate "OA" URL turns out to be an HTML page, Word/PowerPoint
+# document, plain text, or EPUB rather than a PDF, we try to convert it
+# instead of skipping it outright. These conversions are text-reflow only
+# (not pixel-faithful to the original layout) but preserve the content,
+# which is what matters for a merged reading/reference PDF.
+# --------------------------------------------------------------------------
+
+def _text_to_pdf_bytes(title, paragraphs):
+    """Render a list of plain-text paragraphs into a simple PDF via reportlab."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER,
+                             leftMargin=0.9 * inch, rightMargin=0.9 * inch,
+                             topMargin=0.9 * inch, bottomMargin=0.9 * inch)
+    styles = getSampleStyleSheet()
+    body_style = styles["BodyText"]
+    body_style.alignment = TA_LEFT
+    title_style = styles["Title"]
+    story = [Paragraph(_xml_escape(title or "Converted document")[:200], title_style), Spacer(1, 0.25 * inch)]
+    for para in paragraphs:
+        para = (para or "").strip()
+        if not para:
+            continue
+        story.append(Paragraph(_xml_escape(para), body_style))
+        story.append(Spacer(1, 0.12 * inch))
+    if len(story) <= 2:
+        story.append(Paragraph("(No extractable text content found.)", body_style))
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _convert_html_to_pdf(content, title_hint=""):
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(content, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer"]):
+            tag.decompose()
+        title = title_hint or (soup.title.string if soup.title and soup.title.string else "Converted document")
+        paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all(["p", "li", "h1", "h2", "h3"])]
+        paragraphs = [p for p in paragraphs if p]
+        if not paragraphs:
+            paragraphs = [soup.get_text(" ", strip=True)[:20000]]
+        return _text_to_pdf_bytes(title, paragraphs)
+    except Exception:
+        return None
+
+
+def _convert_docx_to_pdf(content, title_hint=""):
+    try:
+        import docx
+        doc = docx.Document(io.BytesIO(content))
+        paragraphs = [p.text for p in doc.paragraphs]
+        return _text_to_pdf_bytes(title_hint or "Converted Word document", paragraphs)
+    except Exception:
+        return None
+
+
+def _convert_pptx_to_pdf(content, title_hint=""):
+    try:
+        from pptx import Presentation
+        prs = Presentation(io.BytesIO(content))
+        paragraphs = []
+        for i, slide in enumerate(prs.slides, start=1):
+            paragraphs.append(f"--- Slide {i} ---")
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for p in shape.text_frame.paragraphs:
+                        text = "".join(run.text for run in p.runs)
+                        if text.strip():
+                            paragraphs.append(text)
+        return _text_to_pdf_bytes(title_hint or "Converted PowerPoint", paragraphs)
+    except Exception:
+        return None
+
+
+def _convert_txt_to_pdf(content, title_hint=""):
+    try:
+        text = content.decode("utf-8", errors="ignore")
+        paragraphs = text.split("\n")
+        return _text_to_pdf_bytes(title_hint or "Converted text file", paragraphs)
+    except Exception:
+        return None
+
+
+def _convert_epub_to_pdf(content, title_hint=""):
+    try:
+        import ebooklib
+        from ebooklib import epub
+        from bs4 import BeautifulSoup
+        book = epub.read_epub(io.BytesIO(content))
+        title = title_hint
+        try:
+            meta = book.get_metadata("DC", "title")
+            if meta:
+                title = meta[0][0]
+        except Exception:
+            pass
+        paragraphs = []
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                soup = BeautifulSoup(item.get_content(), "html.parser")
+                paragraphs.extend(p.get_text(" ", strip=True) for p in soup.find_all(["p", "h1", "h2", "h3"]))
+        paragraphs = [p for p in paragraphs if p]
+        return _text_to_pdf_bytes(title or "Converted EPUB", paragraphs)
+    except Exception:
+        return None
+
+
+def _guess_doc_kind(url, content_type, content_head):
+    """Best-effort classification of a non-PDF response we can attempt to convert."""
+    lower_url = (url or "").lower()
+    ctype = (content_type or "").lower()
+    if lower_url.endswith((".html", ".htm")) or "html" in ctype:
+        return "html"
+    if lower_url.endswith(".docx") or "wordprocessingml" in ctype:
+        return "docx"
+    if lower_url.endswith(".doc") and "word" in ctype:
+        return "doc"  # old binary .doc — not supported by python-docx, will fail gracefully
+    if lower_url.endswith(".pptx") or "presentationml" in ctype:
+        return "pptx"
+    if lower_url.endswith(".ppt") and "powerpoint" in ctype:
+        return "ppt"  # old binary .ppt — not supported, will fail gracefully
+    if lower_url.endswith(".txt") or ctype.startswith("text/plain"):
+        return "txt"
+    if lower_url.endswith(".epub") or "epub" in ctype:
+        return "epub"
+    # sniff by content if extension/content-type were ambiguous
+    head = content_head[:512].lstrip().lower()
+    if head.startswith(b"<!doctype html") or b"<html" in head:
+        return "html"
+    return None
+
+
+def try_convert_to_pdf(content, url, content_type, title_hint=""):
+    kind = _guess_doc_kind(url, content_type, content)
+    if kind == "html":
+        return _convert_html_to_pdf(content, title_hint)
+    if kind == "docx":
+        return _convert_docx_to_pdf(content, title_hint)
+    if kind == "pptx":
+        return _convert_pptx_to_pdf(content, title_hint)
+    if kind == "txt":
+        return _convert_txt_to_pdf(content, title_hint)
+    if kind == "epub":
+        return _convert_epub_to_pdf(content, title_hint)
+    return None  # old binary .doc/.ppt or unrecognized — no reliable pure-python path
+
+
+# --------------------------------------------------------------------------
 # Download with retries + alternate-location fallback
 # --------------------------------------------------------------------------
 
@@ -461,7 +616,7 @@ class DownloadResult:
     size_bytes: int = 0
 
 
-def _attempt_single_url(url, max_size_bytes, timeout=30):
+def _attempt_single_url(url, max_size_bytes, title_hint="", timeout=30):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True)
     except requests.exceptions.Timeout:
@@ -493,6 +648,16 @@ def _attempt_single_url(url, max_size_bytes, timeout=30):
 
     ctype = r.headers.get("Content-Type", "").lower()
     if content[:5] != b"%PDF-" and "pdf" not in ctype:
+        # Not a PDF — try converting it (HTML/DOCX/PPTX/TXT/EPUB) before giving up on this URL.
+        converted = try_convert_to_pdf(content, url, ctype, title_hint)
+        if converted:
+            if max_size_bytes and len(converted) > max_size_bytes:
+                return False, None, "too_large"
+            try:
+                PdfReader(io.BytesIO(converted))
+            except Exception:
+                return False, None, "not_pdf"
+            return True, converted, "ok_converted"
         return False, None, "not_pdf"
 
     try:
@@ -513,10 +678,10 @@ def download_with_fallback(paper, max_size_mb=None, retries=MAX_RETRIES_PER_URL)
     last_reason = "no_candidates"
     for url in paper.oa_urls:
         for attempt in range(1, retries + 1):
-            ok, content, reason = _attempt_single_url(url, max_size_bytes)
+            ok, content, reason = _attempt_single_url(url, max_size_bytes, title_hint=paper.title)
             if ok:
                 return DownloadResult(paper=paper, content=content, ok=True,
-                                       reason="ok", used_url=url, size_bytes=len(content))
+                                       reason=reason, used_url=url, size_bytes=len(content))
             last_reason = reason
             if reason in ("timeout", "server_error"):
                 if attempt < retries:
@@ -562,13 +727,14 @@ def make_toc_page(papers):
     return buf
 
 
-def merge_pdfs(toc_buf, pdf_items):
+def merge_pdfs(toc_buf, pdf_items, progress_callback=None):
     writer = PdfWriter()
     toc_reader = PdfReader(toc_buf)
     for pg in toc_reader.pages:
         writer.add_page(pg)
     page_cursor = len(toc_reader.pages)
-    for paper, content in pdf_items:
+    total = len(pdf_items) or 1
+    for i, (paper, content) in enumerate(pdf_items, start=1):
         try:
             reader = PdfReader(io.BytesIO(content))
             start_page = page_cursor
@@ -577,7 +743,9 @@ def merge_pdfs(toc_buf, pdf_items):
             writer.add_outline_item(paper.title[:100] or "Untitled", start_page)
             page_cursor += len(reader.pages)
         except Exception:
-            continue
+            pass
+        if progress_callback:
+            progress_callback(i / total, paper.title)
     out = io.BytesIO()
     writer.write(out)
     out.seek(0)
@@ -646,8 +814,8 @@ if "search_stage" not in st.session_state:
 with st.form("search_form"):
     col1, col2 = st.columns(2)
     with col1:
-        keyword = st.text_input("Keyword(s) *", placeholder="e.g. enhanced oil recovery")
-        field_name = st.text_input("Field / subject (optional)", placeholder="e.g. Petroleum Engineering")
+        keyword = st.text_input("Keyword(s) (optional if a field is specified)", placeholder="e.g. enhanced oil recovery")
+        field_name = st.text_input("Field / subject (optional if a keyword is specified)", placeholder="e.g. Petroleum Engineering")
         country = st.text_input("Country code (optional, ISO 2-letter)", placeholder="e.g. TR, US, DE")
         institution = st.text_input("University / institution (optional)", placeholder="e.g. Istanbul Technical University")
         use_query_expansion = st.checkbox(
@@ -729,30 +897,32 @@ def run_full_search(keyword_str, year_from, year_to, country, institution, field
 
 
 if submitted:
-    if not keyword.strip():
-        st.error("Please enter at least one keyword.")
+    if not keyword.strip() and not field_name.strip():
+        st.error("Please enter at least a keyword or a field/subject.")
         st.stop()
+
+    search_term = keyword.strip() or field_name.strip()
 
     doc_type = DOC_TYPE_VALUE[doc_type_choice]
     st.session_state["form_values"] = dict(
-        keyword=keyword, field_name=field_name, country=country, institution=institution,
+        keyword=search_term, field_name=field_name, country=country, institution=institution,
         year_from=year_from, year_to=year_to, max_results=max_results, doc_type=doc_type,
         max_pdf_size_mb=max_pdf_size_mb, sources=sources, core_key=core_key,
     )
 
     if use_query_expansion:
         with st.spinner("Running an initial pass to learn common terminology..."):
-            first_pass = run_full_search(keyword, year_from, year_to, country, institution,
+            first_pass = run_full_search(search_term, year_from, year_to, country, institution,
                                           field_name, min(max_results, 15), doc_type, sources, core_key)
         terms = extract_keywords(first_pass)
-        suggestions = suggest_expanded_queries(keyword, terms)
+        suggestions = suggest_expanded_queries(search_term, terms)
         st.session_state["expansion_first_pass"] = first_pass
         st.session_state["expansion_suggestions"] = suggestions
         st.session_state["search_stage"] = "suggested"
         st.session_state.pop("candidates", None)
     else:
         with st.spinner("Querying scholarly databases..."):
-            candidates = run_full_search(keyword, year_from, year_to, country, institution,
+            candidates = run_full_search(search_term, year_from, year_to, country, institution,
                                           field_name, max_results, doc_type, sources, core_key)
         st.session_state["candidates"] = candidates
         st.session_state["target_count"] = max_results
@@ -869,9 +1039,16 @@ if st.session_state.get("candidates") and st.session_state.get("search_stage") =
             st.error("Couldn't download any PDFs from the selection — try broadening filters, "
                       "raising the size limit, or adding more sources.")
         else:
-            with st.spinner("Merging into a single PDF..."):
+            with st.spinner("Building table of contents..."):
                 toc_buf = make_toc_page([p for p, _ in downloaded])
-                merged = merge_pdfs(toc_buf, downloaded)
+
+            merge_progress = st.progress(0.0, text="Merging PDFs...")
+
+            def _merge_progress_cb(frac, title):
+                merge_progress.progress(frac, text=f"Merging: {title[:60]}...")
+
+            merged = merge_pdfs(toc_buf, downloaded, progress_callback=_merge_progress_cb)
+            merge_progress.progress(1.0, text="Merge complete.")
 
             reason_counts = {}
             for r in skipped_results:
@@ -880,6 +1057,10 @@ if st.session_state.get("candidates") and st.session_state.get("search_stage") =
 
             st.success(f"Merged {len(downloaded)} PDFs into one file. "
                        f"{len(skipped_results)} skipped" + (f" ({reason_summary})." if reason_summary else "."))
+            converted_count = sum(1 for r in results if r.reason == "ok_converted")
+            if converted_count:
+                st.caption(f"{converted_count} file(s) weren't natively PDF and were converted "
+                           "(HTML/DOCX/PPTX/TXT/EPUB → text-reflow PDF) before merging.")
 
             colA, colB, colC = st.columns(3)
             with colA:
@@ -916,6 +1097,8 @@ if st.session_state.get("candidates") and st.session_state.get("search_stage") =
 st.divider()
 st.caption(
     "Only papers with a legal open-access PDF (via OpenAlex, Unpaywall, CORE, DOAJ or OpenAIRE) are downloaded. "
+    "Non-PDF OA files (HTML, DOCX, PPTX, TXT, EPUB) are converted to PDF automatically before being counted as "
+    "skipped — old binary .doc/.ppt formats can't be reliably converted without external tools and are skipped. "
     "Each paper's candidate OA locations are tried in sequence with retries on transient errors before being "
     "marked as skipped. Paywalled papers without any OA copy are skipped, not bypassed."
 )
